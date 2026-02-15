@@ -15,7 +15,7 @@ def find_scale(size):
 
 # --- CẤU HÌNH ---
 MODEL_PATH = r'best.pt'
-IMAGE_PATH = r'test.jpg' #thay đường dẫn
+IMAGE_PATH = r'test2.jpg' #thay đường dẫn
 CONFIDENCE_THRESHOLD = 0.4  
 whsize = find_scale(max(cv2.imread(IMAGE_PATH).shape[:2]))
 SLICE_SIZE = whsize         

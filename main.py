@@ -1,154 +1,174 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
-
-def find_scale(size):
-    size = int(size * 0.2)
-    if size < 32:
-        size = 32
-
-    if size % 32 == 0:
-        return size
-
-    return ((size // 32) + 1) * 32
+import math
+import os
 
 # --- CẤU HÌNH ---
-MODEL_PATH = r'best.pt'
-IMAGE_PATH = r'test2.jpg' #thay đường dẫn
-CONFIDENCE_THRESHOLD = 0.4  
-whsize = find_scale(max(cv2.imread(IMAGE_PATH).shape[:2]))
-SLICE_SIZE = whsize         
-OVERLAP_RATIO = 0.25        
+MODEL_PATH = r'best.pt' # chọn best hoặc last tùy kết quả huấn luyện
+IMAGE_PATH = r'test.jpg' 
+CONFIDENCE_THRESHOLD = 0.4
+OVERLAP_RATIO = 0.5  # Tăng lên 50% để đảm bảo không bỏ sót linh kiện ở mép cắt
 
-# --- 1. HÀM TIỀN XỬ LÝ ẢNH (Pre-processing) ---
+# --- HÀM TÍNH KÍCH THƯỚC SCALE (Giữ nguyên logic của bạn) ---
+def find_scale(size):
+    size = int(size * 0.2) # 20% kích thước ảnh
+    if size < 32:
+        size = 32
+    if size % 32 == 0:
+        return size
+    return ((size // 32) + 1) * 32
+
+# --- 1. HÀM TIỀN XỬ LÝ ẢNH ---
 def preprocess_image(image):
-    """
-    Sử dụng CLAHE để cân bằng sáng cục bộ, giúp linh kiện nổi bật hơn trên nền mạch.
-    """
-    # Chuyển sang hệ màu LAB
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    
-    # Áp dụng CLAHE lên kênh L (Lightness)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     cl = clahe.apply(l)
-    
-    # Gộp lại và chuyển về BGR
     limg = cv2.merge((cl, a, b))
     final = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
     return final
 
-# --- 2. HÀM NHẬN DIỆN CẮT LÁT (Tiled Inference) ---
-def predict_tiled(model, source_img, tile_size=640, overlap=0.25, conf=0.5):
-    img_h, img_w = source_img.shape[:2]
+# --- 2. HÀM THÊM PADDING ---
+def pad_image(image, tile_size, stride):
+    img_h, img_w = image.shape[:2]
     
-    # Tính bước nhảy (stride) dựa trên overlap
+    # Tính toán phần dư cần thêm vào
+    pad_h = (tile_size - (img_h % stride)) % stride
+    pad_w = (tile_size - (img_w % stride)) % stride
+    
+    # Cộng thêm tile_size vào padding để đảm bảo quét hết biên
+    # (Tùy chọn: có thể tăng padding nếu muốn quét kỹ hơn ở mép)
+    pad_h += int(tile_size * 0.5) 
+    pad_w += int(tile_size * 0.5)
+
+    # Sử dụng cv2.copyMakeBorder để thêm viền đen (BORDER_CONSTANT)
+    # Trả về ảnh đã pad và kích thước pad để sau này trừ ngược lại tọa độ
+    padded_img = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
+    
+    return padded_img
+
+# --- 3. HÀM NHẬN DIỆN SLIDING WINDOW ---
+def predict_sliding_window(model, source_img, tile_size, overlap=0.5, conf=0.5):
+    # Tính bước nhảy (stride). Overlap càng cao thì stride càng nhỏ, quét càng kỹ.
     stride = int(tile_size * (1 - overlap))
+    
+    # 1. Thêm Padding cho ảnh gốc
+    padded_img = pad_image(source_img, tile_size, stride)
+    pad_h, pad_w = padded_img.shape[:2]
     
     all_boxes = []
     all_scores = []
     all_class_ids = []
 
-    print(f"🔄 Đang xử lý ảnh kích thước {img_w}x{img_h} với ô cắt {tile_size}x{tile_size}...")
+    print(f"🔄 Đang xử lý Sliding Window...")
+    print(f"   - Kích thước gốc: {source_img.shape[1]}x{source_img.shape[0]}")
+    print(f"   - Kích thước sau padding: {pad_w}x{pad_h}")
+    print(f"   - Tile Size: {tile_size} | Stride: {stride} | Overlap: {int(overlap*100)}%")
 
-    # Duyệt qua từng ô của ảnh
-    for y in range(0, img_h, stride):
-        for x in range(0, img_w, stride):
-            # Xác định tọa độ cắt, đảm bảo không vượt quá kích thước ảnh
-            x_end = min(x + tile_size, img_w)
-            y_end = min(y + tile_size, img_h)
-            x_start = x_end - tile_size if x_end - tile_size > 0 else 0
-            y_start = y_end - tile_size if y_end - tile_size > 0 else 0
+    # 2. Duyệt vòng lặp (Correlation-like traversal)
+    # Duyệt y từ 0 đến hết chiều cao đã pad, bước nhảy là stride
+    count = 0
+    for y in range(0, pad_h - tile_size + 1, stride):
+        for x in range(0, pad_w - tile_size + 1, stride):
+            
+            # Cắt ảnh (Crop)
+            tile = padded_img[y:y+tile_size, x:x+tile_size]
+            
+            # Nếu tile cắt ra bị nhỏ hơn kích thước quy định (ở mép cuối), bỏ qua
+            if tile.shape[0] != tile_size or tile.shape[1] != tile_size:
+                continue
 
-            # Cắt ảnh
-            tile = source_img[y_start:y_end, x_start:x_end]
-
-            # Nhận diện trên từng ô nhỏ
+            count += 1
+            # Nhận diện
             results = model.predict(tile, conf=conf, verbose=False)
             
-            # Xử lý kết quả
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
-                    # Lấy tọa độ tương đối trong ô (x1, y1, x2, y2)
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    bx1, by1, bx2, by2 = box.xyxy[0].cpu().numpy()
                     
-                    # Chuyển đổi sang tọa độ toàn cục của ảnh gốc
-                    global_x1 = int(x1 + x_start)
-                    global_y1 = int(y1 + y_start)
-                    global_x2 = int(x2 + x_start)
-                    global_y2 = int(y2 + y_start)
+                    # 3. Mapping tọa độ: Cộng thêm vị trí của ô cắt (x, y)
+                    global_x1 = int(bx1 + x)
+                    global_y1 = int(by1 + y)
+                    global_x2 = int(bx2 + x)
+                    global_y2 = int(by2 + y)
                     
-                    all_boxes.append([global_x1, global_y1, global_x2 - global_x1, global_y2 - global_y1]) # Format cho NMS: [x, y, w, h]
+                    # Kiểm tra: Nếu hộp nằm hoàn toàn trong vùng padding (ngoài ảnh gốc), bỏ qua
+                    if global_x1 >= source_img.shape[1] or global_y1 >= source_img.shape[0]:
+                        continue
+
+                    # Giới hạn tọa độ trong khung ảnh gốc
+                    global_x1 = min(max(0, global_x1), source_img.shape[1])
+                    global_y1 = min(max(0, global_y1), source_img.shape[0])
+                    global_x2 = min(max(0, global_x2), source_img.shape[1])
+                    global_y2 = min(max(0, global_y2), source_img.shape[0])
+
+                    all_boxes.append([global_x1, global_y1, global_x2 - global_x1, global_y2 - global_y1])
                     all_scores.append(float(box.conf[0]))
                     all_class_ids.append(int(box.cls[0]))
-
+    
+    print(f"✅ Đã quét xong {count} ô cửa sổ.")
     return all_boxes, all_scores, all_class_ids
 
-# --- 3. HÀM MAIN ---
+# --- 4. HÀM MAIN ---
 def detect_and_highlight():
     try:
-        # 1. Load Model
-        print(f"Đang tải model từ: {MODEL_PATH}...")
-        model = YOLO(MODEL_PATH)
-
-        # 2. Đọc ảnh
-        original_img = cv2.imread(IMAGE_PATH)
-        if original_img is None:
-            print("❌ Không tìm thấy ảnh!")
+        # Kiểm tra tồn tại
+        if not os.path.exists(MODEL_PATH) or not os.path.exists(IMAGE_PATH):
+            print("❌ Lỗi: Không tìm thấy file model hoặc ảnh.")
             return
 
-        # 3. Tiền xử lý ảnh (Làm nét, cân bằng sáng)
+        print(f"⏳ Đang tải model từ: {MODEL_PATH}...")
+        model = YOLO(MODEL_PATH)
+
+        original_img = cv2.imread(IMAGE_PATH)
+        if original_img is None:
+            print("❌ Lỗi đọc ảnh.")
+            return
+
+        # Tính kích thước tile động
+        whsize = find_scale(max(original_img.shape[:2]))
+        
+        # Tiền xử lý
         processed_img = preprocess_image(original_img)
         
-        # 4. Chạy nhận diện theo phương pháp cắt lát (Tiling)
-        boxes, scores, class_ids = predict_tiled(
+        # Chạy Sliding Window
+        boxes, scores, class_ids = predict_sliding_window(
             model, 
             processed_img, 
-            tile_size=SLICE_SIZE, 
+            tile_size=whsize, 
             overlap=OVERLAP_RATIO, 
             conf=CONFIDENCE_THRESHOLD
         )
 
-        # 5. Áp dụng Non-Maximum Suppression (NMS) để loại bỏ các khung trùng nhau do cắt chồng lấn
-        # 0.4 là ngưỡng giao nhau (IOU threshold)
+        # NMS (Cực kỳ quan trọng khi overlap cao)
+        # Tăng overlap dẫn đến 1 vật thể bị phát hiện nhiều lần -> NMS sẽ gộp lại
         indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=CONFIDENCE_THRESHOLD, nms_threshold=0.4)
 
-        print(f"✅ Đã tìm thấy {len(indices)} linh kiện sau khi gộp kết quả.")
+        print(f"🎯 Kết quả: Tìm thấy {len(indices)} linh kiện duy nhất.")
 
-        # 6. Vẽ kết quả lên ảnh gốc
         for i in indices:
-            # cv2.dnn.NMSBoxes trả về index dạng list hoặc mảng con, cần xử lý để lấy int
             idx = i if isinstance(i, (int, np.integer)) else i[0]
-            
             x, y, w, h = boxes[idx]
             label = str(model.names[class_ids[idx]])
             score = scores[idx]
 
-            # Vẽ khung chữ nhật
             cv2.rectangle(original_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
-            # Viết tên linh kiện
             cv2.putText(original_img, f"{label} {score:.2f}", (x, y - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            print(f"- {label}: {score:.2f}")
 
-        # 7. Hiển thị kết quả
-        # Resize ảnh nhỏ lại để hiển thị vừa màn hình nếu ảnh quá lớn
+        # Resize hiển thị
         display_img = original_img.copy()
         h, w = display_img.shape[:2]
         if w > 1280:
             scale = 1280 / w
             display_img = cv2.resize(display_img, (1280, int(h * scale)))
 
-        cv2.imshow("Ket qua Nhan dien Nang cao (Tiled)", display_img)
+        cv2.imshow("Sliding Window Result", display_img)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-        
-        # Lưu ảnh full HD
         cv2.imwrite("ket_qua.jpg", original_img)
-        print("💾 Đã lưu ảnh kết quả thành 'ket_qua_pcb_tiled.jpg'")
 
     except Exception as e:
         print(f"❌ Có lỗi xảy ra: {e}")
